@@ -75,6 +75,36 @@
 
   const FONT_FAMILY = "'JetBrains Mono', Menlo, Consolas, monospace";
 
+  // ---------- Row layout ----------
+  // Below BREAKPOINT_2ROW the 52 cards wrap onto two lines instead of
+  // shrinking further on one - narrow viewports were otherwise squeezing
+  // cards down to unreadable slivers while leaving the row's fixed height
+  // mostly blank.
+
+  const CARD_GAP = 3;
+  const CARD_MARGIN = 20;
+  const CARD_MAX_W = 24;
+  const ID_AREA_HEIGHT = 18;
+  const ROW_BOTTOM_PAD = 12;
+  const LINE_GAP = 4;
+  const BREAKPOINT_2ROW = 700;
+  const ID_FONT_SIZE = 10;
+  const ID_FONT_MIN = 6;
+
+  let ROW_HEIGHT = 66;
+  let layout = { twoRow: false, cardsPerLine: N, cardW: 24, cardH: 24 * 1.45 };
+
+  function computeLayout(width) {
+    const availWidth = width - CARD_MARGIN * 2;
+    const twoRow = width < BREAKPOINT_2ROW;
+    const cardsPerLine = twoRow ? Math.ceil(N / 2) : N;
+    const cardW = Math.max(2, Math.min(CARD_MAX_W, (availWidth - CARD_GAP * (cardsPerLine - 1)) / cardsPerLine));
+    const cardH = cardW * 1.45;
+    const cardBlockHeight = twoRow ? cardH * 2 + LINE_GAP : cardH;
+    layout = { twoRow, cardsPerLine, cardW, cardH };
+    ROW_HEIGHT = ID_AREA_HEIGHT + cardBlockHeight + ROW_BOTTOM_PAD;
+  }
+
   // ---------- Canvas setup ----------
 
   const canvas = document.getElementById("c");
@@ -91,6 +121,7 @@
     canvas.style.width = W + "px";
     canvas.style.height = H + "px";
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    computeLayout(W);
   }
   window.addEventListener("resize", resize);
   resize();
@@ -102,8 +133,6 @@
 
   let topId = 1n;
   let fracRows = 0;
-
-  const ROW_HEIGHT = 66;
 
   // The highest legal topId such that the last deck (MAX_ID) lands flush at
   // the bottom of the viewport, rather than alone at the very top with a
@@ -140,7 +169,12 @@
   const MAX_EXPONENT = MAX_ID_STR_LEN; // enough to traverse the whole space fast
   const EXPONENT_GROWTH = 0.028;       // per unit of input magnitude
   const IDLE_DECAY = 0.92;             // multiplicative decay per frame once idle
-  const IDLE_TIMEOUT = 120;            // ms with no input before decay kicks in
+  // Wheel ticks during a continuous trackpad flick land <50ms apart, but
+  // separate touch swipes naturally have a 150-350ms gap between lifting a
+  // finger and touching down again. A short timeout was decaying nearly all
+  // of the ramp between swipes, so repeated flicks never compounded the way
+  // they do on a trackpad. 400ms covers that gap for both input types.
+  const IDLE_TIMEOUT = 400;            // ms with no input before decay kicks in
   const BASE_ROWS_PER_FRAME = 0.05;    // speed at exponent 0
 
   function addScrollInput(deltaY) {
@@ -215,19 +249,37 @@
   }, { passive: false });
 
   let touchActive = false;
+  let touchIsScrollbar = false;
   let touchLastY = 0;
   let touchLastT = 0;
 
   canvas.addEventListener("touchstart", (e) => {
     if (e.touches.length !== 1) return;
+    const t0 = e.touches[0];
+
+    const g = scrollbarGeometry();
+    if (pointerOverScrollbar(t0.clientX, t0.clientY, g)) {
+      touchIsScrollbar = true;
+      beginScrollbarDrag(t0.clientY, g);
+      return;
+    }
+
+    touchIsScrollbar = false;
     touchActive = true;
-    touchLastY = e.touches[0].clientY;
+    touchLastY = t0.clientY;
     touchLastT = performance.now();
-    scrollDirection = 0;
-    accelExponent = 0;
+    // Note: accelExponent is deliberately left alone here (only a direction
+    // reversal resets it, inside addScrollInput) so consecutive flicks keep
+    // building on each other the way trackpad wheel events do, instead of
+    // restarting from zero on every new touch.
   }, { passive: true });
 
   canvas.addEventListener("touchmove", (e) => {
+    if (touchIsScrollbar) {
+      e.preventDefault();
+      setTopFromScrollbarY(e.touches[0].clientY, scrollbarGeometry());
+      return;
+    }
     if (!touchActive) return;
     e.preventDefault();
     const y = e.touches[0].clientY;
@@ -243,6 +295,10 @@
 
   canvas.addEventListener("touchend", () => {
     touchActive = false;
+    if (touchIsScrollbar) {
+      touchIsScrollbar = false;
+      scrollbarDragging = false;
+    }
   }, { passive: true });
 
   // ---------- Scrollbar ----------
@@ -254,7 +310,7 @@
   const SCROLLBAR_MARGIN = 6;
   const SCROLLBAR_TRACK_INSET = 10;
   const SCROLLBAR_MIN_THUMB = 44;
-  const SCROLLBAR_HIT_PAD = 12; // extra horizontal grab margin beyond the drawn thumb
+  const SCROLLBAR_HIT_PAD = 18; // extra horizontal grab margin beyond the drawn thumb (~44px touch target)
 
   let scrollbarDragging = false;
   let scrollbarHover = false;
@@ -299,20 +355,24 @@
     displayJitter = 0;
   }
 
+  function beginScrollbarDrag(clientY, g) {
+    scrollbarDragging = true;
+    scrollDirection = 0;
+    accelExponent = 0;
+    const withinThumb = clientY >= g.thumbTop && clientY <= g.thumbTop + g.thumbHeight;
+    if (withinThumb) {
+      scrollbarDragOffset = clientY - g.thumbTop;
+    } else {
+      scrollbarDragOffset = g.thumbHeight / 2;
+      setTopFromScrollbarY(clientY, g);
+    }
+  }
+
   canvas.addEventListener("mousedown", (e) => {
     const g = scrollbarGeometry();
     if (!pointerOverScrollbar(e.clientX, e.clientY, g)) return;
     e.preventDefault();
-    scrollbarDragging = true;
-    scrollDirection = 0;
-    accelExponent = 0;
-    const withinThumb = e.clientY >= g.thumbTop && e.clientY <= g.thumbTop + g.thumbHeight;
-    if (withinThumb) {
-      scrollbarDragOffset = e.clientY - g.thumbTop;
-    } else {
-      scrollbarDragOffset = g.thumbHeight / 2;
-      setTopFromScrollbarY(e.clientY, g);
-    }
+    beginScrollbarDrag(e.clientY, g);
   });
 
   window.addEventListener("mousemove", (e) => {
@@ -332,36 +392,43 @@
 
   // ---------- Rendering ----------
 
-  const CARD_GAP = 3;
-  const CARD_MARGIN = 20;
-
   function drawRow(y, idBigInt) {
     if (idBigInt < 1n || idBigInt > MAX_ID) return;
 
     const idStr = padId(idBigInt);
     const perm = nthPermutation(idBigInt - 1n);
 
-    // ID label
+    // ID label - shrink to fit on narrow viewports rather than clip. Digit
+    // count varies hugely by row (short near deck #1, up to 68 digits deep
+    // into the space), so this is measured per row.
+    const availTextWidth = W - CARD_MARGIN - SCROLLBAR_MARGIN - SCROLLBAR_WIDTH - SCROLLBAR_HIT_PAD;
+    let idFontSize = ID_FONT_SIZE;
+    ctx.font = "500 " + idFontSize + "px " + FONT_FAMILY;
+    const idTextWidth = ctx.measureText(idStr).width;
+    if (idTextWidth > availTextWidth) {
+      idFontSize = Math.max(ID_FONT_MIN, idFontSize * availTextWidth / idTextWidth);
+      ctx.font = "500 " + idFontSize + "px " + FONT_FAMILY;
+    }
     ctx.fillStyle = "#aaaaaa";
-    ctx.font = "500 10px " + FONT_FAMILY;
     ctx.textBaseline = "alphabetic";
     ctx.textAlign = "left";
     ctx.fillText(idStr, CARD_MARGIN, y + 13);
 
-    // Mini cards
-    const availWidth = W - CARD_MARGIN * 2;
-    const cardW = Math.min(24, (availWidth - CARD_GAP * (N - 1)) / N);
-    const cardH = cardW * 1.45;
-    const cardsTop = y + 18;
+    // Mini cards - one line, or two on narrow viewports (see computeLayout)
+    const { cardsPerLine, cardW, cardH, twoRow } = layout;
+    const cardsTop = y + ID_AREA_HEIGHT;
 
     for (let i = 0; i < N; i++) {
       const { rank, suit, red } = cardLabel(perm[i]);
-      const x = CARD_MARGIN + i * (cardW + CARD_GAP);
+      const line = twoRow ? Math.floor(i / cardsPerLine) : 0;
+      const col = twoRow ? i % cardsPerLine : i;
+      const x = CARD_MARGIN + col * (cardW + CARD_GAP);
+      const lineTop = cardsTop + line * (cardH + LINE_GAP);
 
       ctx.fillStyle = "#fbfbfa";
       ctx.strokeStyle = "#c9c9c9";
       ctx.lineWidth = 1;
-      roundRect(ctx, x, cardsTop, cardW, cardH, 3);
+      roundRect(ctx, x, lineTop, cardW, cardH, 3);
       ctx.fill();
       ctx.stroke();
 
@@ -369,8 +436,8 @@
       const fontSize = Math.max(7, Math.min(10, cardW * 0.42));
       ctx.font = "500 " + fontSize + "px " + FONT_FAMILY;
       ctx.textAlign = "center";
-      ctx.fillText(rank, x + cardW / 2, cardsTop + cardH * 0.42);
-      ctx.fillText(suit, x + cardW / 2, cardsTop + cardH * 0.82);
+      ctx.fillText(rank, x + cardW / 2, lineTop + cardH * 0.42);
+      ctx.fillText(suit, x + cardW / 2, lineTop + cardH * 0.82);
     }
   }
 
