@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>All Decks</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #ffffff;
+    touch-action: none;
+    overscroll-behavior: none;
+  }
+  canvas {
+    display: block;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  // ---------- Combinatorics ----------
+
+  const N = 52;
+
+  // factorials[k] = k!  (BigInt), factorials[0] = 1
+  const factorials = [1n];
+  for (let i = 1; i <= N; i++) factorials.push(factorials[i - 1] * BigInt(i));
+
+  const MAX_ID = factorials[N];               // 52!  (total number of decks)
+  const MAX_ID_STR_LEN = MAX_ID.toString().length;
+
+  const SUITS = ["♠", "♥", "♦", "♣"]; // spade heart diamond club
+  const RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
+  const RED_SUITS = new Set([1, 2]);
+
+  // Decode 0-based permutation index (0 .. 52!-1) into an array of 52 card
+  // indices (0..51) using the factorial number system (Lehmer code).
+  function nthPermutation(idx0) {
+    const elements = new Array(N);
+    for (let i = 0; i < N; i++) elements[i] = i;
+    const result = new Array(N);
+    let idx = idx0;
+    for (let i = N; i >= 1; i--) {
+      const f = factorials[i - 1];
+      const pos = idx / f; // BigInt division -> floor
+      idx = idx % f;
+      const p = Number(pos);
+      result[N - i] = elements[p];
+      elements.splice(p, 1);
+    }
+    return result;
+  }
+
+  function cardLabel(cardIndex) {
+    const suit = Math.floor(cardIndex / 13);
+    const rank = cardIndex % 13;
+    return { rank: RANKS[rank], suit: SUITS[suit], red: RED_SUITS.has(suit) };
+  }
+
+  function padId(idBigInt) {
+    return "Deck #" + idBigInt.toString().padStart(MAX_ID_STR_LEN, "0");
+  }
+
+  const FONT_FAMILY = "'JetBrains Mono', Menlo, Consolas, monospace";
+
+  // ---------- Canvas setup ----------
+
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  let dpr = Math.max(1, window.devicePixelRatio || 1);
+  let W = 0, H = 0;
+
+  function resize() {
+    dpr = Math.max(1, window.devicePixelRatio || 1);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ---------- Scroll position state ----------
+  // topId: the (1-based) deck id of the row currently anchored at the top.
+  // fracRows: leftover fractional row offset (in "row units", can be
+  //   negative), used for smooth sub-pixel scrolling at low speeds.
+
+  let topId = 1n;
+  let fracRows = 0;
+
+  const ROW_HEIGHT = 66;
+
+  function clampTop() {
+    if (topId < 1n) { topId = 1n; fracRows = 0; }
+    if (topId > MAX_ID) { topId = MAX_ID; fracRows = 0; }
+  }
+
+  // ---------- Acceleration model ----------
+  //
+  // accelExponent grows continuously while the user keeps scrolling in the
+  // same direction, giving an exponential ramp in speed (rows/frame = 10^exp).
+  // It decays back to 0 when input stops, producing a short coast-down.
+
+  let accelExponent = 0;
+  let scrollDirection = 0; // -1, 0, +1
+  let lastInputTime = 0;
+
+  // At high speed, huge floating point jumps land on exact row boundaries
+  // every frame (float precision beyond 2^53 has no fractional part left),
+  // which pins the top row's pixel offset at 0 and makes it look "frozen"
+  // in place while only the digits blur past. displayJitter randomizes that
+  // offset each frame at speed so the grid always looks like it's sliding.
+  let displayJitter = 0;
+
+  const MAX_EXPONENT = MAX_ID_STR_LEN; // enough to traverse the whole space fast
+  const EXPONENT_GROWTH = 0.028;       // per unit of input magnitude
+  const IDLE_DECAY = 0.92;             // multiplicative decay per frame once idle
+  const IDLE_TIMEOUT = 120;            // ms with no input before decay kicks in
+  const BASE_ROWS_PER_FRAME = 0.05;    // speed at exponent 0
+
+  function addScrollInput(deltaY) {
+    const now = performance.now();
+    const dir = Math.sign(deltaY);
+    if (dir === 0) return;
+
+    if (dir !== scrollDirection) {
+      // direction reversed: reset the ramp
+      accelExponent = 0;
+    }
+    scrollDirection = dir;
+    lastInputTime = now;
+
+    const magnitude = Math.min(Math.abs(deltaY), 400);
+    accelExponent = Math.min(MAX_EXPONENT, accelExponent + magnitude * EXPONENT_GROWTH * 0.02);
+  }
+
+  function stepAnimation() {
+    const now = performance.now();
+
+    if (scrollDirection !== 0) {
+      if (now - lastInputTime > IDLE_TIMEOUT) {
+        accelExponent *= IDLE_DECAY;
+        if (accelExponent < 0.01) {
+          accelExponent = 0;
+          scrollDirection = 0;
+        }
+      }
+
+      if (scrollDirection !== 0) {
+        const rowsPerFrame = BASE_ROWS_PER_FRAME * Math.pow(10, accelExponent);
+        fracRows += scrollDirection * rowsPerFrame;
+
+        const whole = Math.trunc(fracRows);
+        if (whole !== 0) {
+          topId += BigInt(whole);
+          fracRows -= whole;
+          clampTop();
+        }
+
+        // Hitting either end: hard-stop instead of jittering/ramping against
+        // the wall. Scrolling further in the same direction does nothing
+        // until the user reverses.
+        const atBoundary = (topId <= 1n && scrollDirection < 0) ||
+                            (topId >= MAX_ID && scrollDirection > 0);
+        if (atBoundary) {
+          fracRows = 0;
+          accelExponent = 0;
+          displayJitter = 0;
+        } else {
+          // Fade in random pixel jitter once we're moving fast enough that
+          // the precision-loss "lock" would otherwise show.
+          const jitterAmount = Math.min(1, rowsPerFrame / 30);
+          displayJitter = jitterAmount > 0.02
+            ? (Math.random() - 0.5) * ROW_HEIGHT * jitterAmount
+            : 0;
+        }
+      } else {
+        displayJitter = 0;
+      }
+    } else {
+      displayJitter = 0;
+    }
+  }
+
+  // ---------- Input handling ----------
+
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    addScrollInput(e.deltaY);
+  }, { passive: false });
+
+  let touchActive = false;
+  let touchLastY = 0;
+  let touchLastT = 0;
+
+  canvas.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 1) return;
+    touchActive = true;
+    touchLastY = e.touches[0].clientY;
+    touchLastT = performance.now();
+    scrollDirection = 0;
+    accelExponent = 0;
+  }, { passive: true });
+
+  canvas.addEventListener("touchmove", (e) => {
+    if (!touchActive) return;
+    e.preventDefault();
+    const y = e.touches[0].clientY;
+    const t = performance.now();
+    const dy = touchLastY - y; // finger moves up -> content scrolls down (id increases)
+    const dt = Math.max(1, t - touchLastT);
+    touchLastY = y;
+    touchLastT = t;
+    // Normalize to a wheel-like magnitude, scaled by swipe speed.
+    const speedScale = Math.min(4, 16 / dt);
+    addScrollInput(dy * speedScale);
+  }, { passive: false });
+
+  canvas.addEventListener("touchend", () => {
+    touchActive = false;
+  }, { passive: true });
+
+  // ---------- Rendering ----------
+
+  const CARD_GAP = 3;
+  const CARD_MARGIN = 20;
+
+  function drawRow(y, idBigInt) {
+    if (idBigInt < 1n || idBigInt > MAX_ID) return;
+
+    const idStr = padId(idBigInt);
+    const perm = nthPermutation(idBigInt - 1n);
+
+    // ID label
+    ctx.fillStyle = "#aaaaaa";
+    ctx.font = "500 10px " + FONT_FAMILY;
+    ctx.textBaseline = "alphabetic";
+    ctx.textAlign = "left";
+    ctx.fillText(idStr, CARD_MARGIN, y + 13);
+
+    // Mini cards
+    const availWidth = W - CARD_MARGIN * 2;
+    const cardW = Math.min(24, (availWidth - CARD_GAP * (N - 1)) / N);
+    const cardH = cardW * 1.45;
+    const cardsTop = y + 18;
+
+    for (let i = 0; i < N; i++) {
+      const { rank, suit, red } = cardLabel(perm[i]);
+      const x = CARD_MARGIN + i * (cardW + CARD_GAP);
+
+      ctx.fillStyle = "#fbfbfa";
+      ctx.strokeStyle = "#c9c9c9";
+      ctx.lineWidth = 1;
+      roundRect(ctx, x, cardsTop, cardW, cardH, 3);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = red ? "#c62828" : "#242424";
+      const fontSize = Math.max(7, Math.min(10, cardW * 0.42));
+      ctx.font = "500 " + fontSize + "px " + FONT_FAMILY;
+      ctx.textAlign = "center";
+      ctx.fillText(rank, x + cardW / 2, cardsTop + cardH * 0.42);
+      ctx.fillText(suit, x + cardW / 2, cardsTop + cardH * 0.82);
+    }
+  }
+
+  function roundRect(c, x, y, w, h, r) {
+    c.beginPath();
+    c.moveTo(x + r, y);
+    c.arcTo(x + w, y, x + w, y + h, r);
+    c.arcTo(x + w, y + h, x, y + h, r);
+    c.arcTo(x, y + h, x, y, r);
+    c.arcTo(x, y, x + w, y, r);
+    c.closePath();
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, W, H);
+
+    const pixelOffset = fracRows * ROW_HEIGHT + displayJitter;
+    const numRows = Math.ceil(H / ROW_HEIGHT) + 2;
+
+    // Start one row above topId so the previous deck slides into view from
+    // the top the moment an upward scroll begins, instead of only appearing
+    // once topId itself decrements.
+    for (let i = -1; i < numRows; i++) {
+      const rowId = topId + BigInt(i);
+      const y = i * ROW_HEIGHT - pixelOffset;
+      if (y > H) break;
+      drawRow(y, rowId);
+    }
+  }
+
+  function loop() {
+    stepAnimation();
+    render();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
