@@ -191,6 +191,7 @@
 
     const magnitude = Math.min(Math.abs(deltaY), 400);
     accelExponent = Math.min(MAX_EXPONENT, accelExponent + magnitude * EXPONENT_GROWTH * 0.02);
+    shuffleAnim = null; // manual scrolling interrupts an in-flight shuffle
   }
 
   function stepAnimation() {
@@ -256,6 +257,13 @@
   canvas.addEventListener("touchstart", (e) => {
     if (e.touches.length !== 1) return;
     const t0 = e.touches[0];
+
+    if (pointerOverShuffleButton(t0.clientX, t0.clientY, shuffleButtonGeometry())) {
+      startShuffle();
+      touchActive = false;
+      touchIsScrollbar = false;
+      return;
+    }
 
     const g = scrollbarGeometry();
     if (pointerOverScrollbar(t0.clientX, t0.clientY, g)) {
@@ -359,6 +367,7 @@
     scrollbarDragging = true;
     scrollDirection = 0;
     accelExponent = 0;
+    shuffleAnim = null; // manual scrolling interrupts an in-flight shuffle
     const withinThumb = clientY >= g.thumbTop && clientY <= g.thumbTop + g.thumbHeight;
     if (withinThumb) {
       scrollbarDragOffset = clientY - g.thumbTop;
@@ -369,6 +378,11 @@
   }
 
   canvas.addEventListener("mousedown", (e) => {
+    if (pointerOverShuffleButton(e.clientX, e.clientY, shuffleButtonGeometry())) {
+      e.preventDefault();
+      startShuffle();
+      return;
+    }
     const g = scrollbarGeometry();
     if (!pointerOverScrollbar(e.clientX, e.clientY, g)) return;
     e.preventDefault();
@@ -378,6 +392,7 @@
   window.addEventListener("mousemove", (e) => {
     const g = scrollbarGeometry();
     scrollbarHover = pointerOverScrollbar(e.clientX, e.clientY, g);
+    shuffleHover = pointerOverShuffleButton(e.clientX, e.clientY, shuffleButtonGeometry());
     if (!scrollbarDragging) return;
     setTopFromScrollbarY(e.clientY, g);
   });
@@ -389,6 +404,85 @@
   canvas.addEventListener("mouseleave", () => {
     if (!scrollbarDragging) scrollbarHover = false;
   });
+
+  // ---------- Shuffle ----------
+  // A floating button that jumps to a uniformly random deck. Animated as an
+  // eased scroll rather than an instant cut so it still reads as scrolling
+  // through the same space rather than teleporting.
+
+  const SHUFFLE_LABEL = "shuffle";
+  const SHUFFLE_BTN_FONT_SIZE = 12;
+  const SHUFFLE_BTN_HEIGHT = 38;
+  const SHUFFLE_BTN_PAD_X = 18;
+  const SHUFFLE_BTN_RIGHT_MARGIN = 48; // clears the scrollbar's hit strip
+  const SHUFFLE_BTN_BOTTOM_MARGIN = 24;
+  const SHUFFLE_DURATION = 1100; // ms
+
+  let shuffleAnim = null; // { startId, targetId, startTime }
+  let shuffleHover = false;
+  let shufflePressedUntil = 0;
+
+  function shuffleButtonGeometry() {
+    ctx.font = "600 " + SHUFFLE_BTN_FONT_SIZE + "px " + FONT_FAMILY;
+    const w = ctx.measureText(SHUFFLE_LABEL).width + SHUFFLE_BTN_PAD_X * 2;
+    const h = SHUFFLE_BTN_HEIGHT;
+    const x = W - SHUFFLE_BTN_RIGHT_MARGIN - w;
+    const y = H - SHUFFLE_BTN_BOTTOM_MARGIN - h;
+    return { x, y, w, h };
+  }
+
+  function pointerOverShuffleButton(clientX, clientY, g) {
+    return clientX >= g.x && clientX <= g.x + g.w && clientY >= g.y && clientY <= g.y + g.h;
+  }
+
+  // Uniform random BigInt in [0, maxExclusive). Math.random() alone only
+  // has ~53 bits of entropy, nowhere near enough to reach most of 52!'s
+  // ~226-bit range, so this draws random bytes instead.
+  function randomBigIntBelow(maxExclusive) {
+    if (maxExclusive <= 0n) return 0n;
+    const bitLen = maxExclusive.toString(2).length;
+    const byteLen = Math.ceil(bitLen / 8) + 1; // extra byte to reduce modulo bias
+    const bytes = new Uint8Array(byteLen);
+    crypto.getRandomValues(bytes);
+    let n = 0n;
+    for (const b of bytes) n = (n << 8n) | BigInt(b);
+    return n % maxExclusive;
+  }
+
+  function startShuffle() {
+    const top = maxTopId();
+    const target = randomBigIntBelow(top) + 1n; // uniform in [1, top]
+    scrollDirection = 0;
+    accelExponent = 0;
+    shuffleAnim = { startId: topId, targetId: target, startTime: performance.now() };
+    shufflePressedUntil = performance.now() + 180;
+  }
+
+  // Returns true while a shuffle animation is driving topId, so the main
+  // loop can skip the regular wheel/touch physics for that frame.
+  function stepShuffle() {
+    if (!shuffleAnim) return false;
+    const t = Math.min(1, (performance.now() - shuffleAnim.startTime) / SHUFFLE_DURATION);
+    const eased = 1 - Math.pow(1 - t, 3); // ease-out cubic
+
+    const prevTopId = topId;
+    if (t >= 1) {
+      topId = shuffleAnim.targetId;
+      shuffleAnim = null;
+    } else {
+      const delta = Number(shuffleAnim.targetId - shuffleAnim.startId);
+      topId = shuffleAnim.startId + BigInt(Math.round(delta * eased));
+    }
+    fracRows = 0;
+
+    // Same "randomize the pixel offset once moving fast" trick as the wheel
+    // path - otherwise the huge in-between jumps look pinned in place.
+    const rowsMoved = Math.abs(Number(topId - prevTopId));
+    const jitterAmount = Math.min(1, rowsMoved / 30);
+    displayJitter = jitterAmount > 0.02 ? (Math.random() - 0.5) * ROW_HEIGHT * jitterAmount : 0;
+
+    return true;
+  }
 
   // ---------- Rendering ----------
 
@@ -460,6 +554,26 @@
     ctx.fill();
   }
 
+  function drawShuffleButton() {
+    const g = shuffleButtonGeometry();
+    const pressed = performance.now() < shufflePressedUntil;
+
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,0.28)";
+    ctx.shadowBlur = 10;
+    ctx.shadowOffsetY = 2;
+    roundRect(ctx, g.x, g.y, g.w, g.h, g.h / 2);
+    ctx.fillStyle = pressed ? "#3a3a3a" : (shuffleHover ? "#333333" : "#242424");
+    ctx.fill();
+    ctx.restore();
+
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "600 " + SHUFFLE_BTN_FONT_SIZE + "px " + FONT_FAMILY;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(SHUFFLE_LABEL, g.x + g.w / 2, g.y + g.h / 2 + 1);
+  }
+
   function render() {
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = "#ffffff";
@@ -479,10 +593,13 @@
     }
 
     drawScrollbar();
+    drawShuffleButton();
   }
 
   function loop() {
-    stepAnimation();
+    if (!stepShuffle()) {
+      stepAnimation();
+    }
     render();
     requestAnimationFrame(loop);
   }
