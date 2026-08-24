@@ -39,6 +39,7 @@
 
   const MAX_ID = factorials[N];               // 52!  (total number of decks)
   const MAX_ID_STR_LEN = MAX_ID.toString().length;
+  const MAX_ID_NUMBER = Number(MAX_ID);        // approx, only used for scrollbar position
 
   const SUITS = ["♠", "♥", "♦", "♣"]; // spade heart diamond club
   const RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
@@ -104,9 +105,19 @@
 
   const ROW_HEIGHT = 66;
 
+  // The highest legal topId such that the last deck (MAX_ID) lands flush at
+  // the bottom of the viewport, rather than alone at the very top with a
+  // blank screen beneath it.
+  function maxTopId() {
+    const rowsFullyVisible = Math.max(1, Math.floor(H / ROW_HEIGHT));
+    const top = MAX_ID - BigInt(rowsFullyVisible - 1);
+    return top < 1n ? 1n : top;
+  }
+
   function clampTop() {
     if (topId < 1n) { topId = 1n; fracRows = 0; }
-    if (topId > MAX_ID) { topId = MAX_ID; fracRows = 0; }
+    const top = maxTopId();
+    if (topId > top) { topId = top; fracRows = 0; }
   }
 
   // ---------- Acceleration model ----------
@@ -175,7 +186,7 @@
         // the wall. Scrolling further in the same direction does nothing
         // until the user reverses.
         const atBoundary = (topId <= 1n && scrollDirection < 0) ||
-                            (topId >= MAX_ID && scrollDirection > 0);
+                            (topId >= maxTopId() && scrollDirection > 0);
         if (atBoundary) {
           fracRows = 0;
           accelExponent = 0;
@@ -234,6 +245,91 @@
     touchActive = false;
   }, { passive: true });
 
+  // ---------- Scrollbar ----------
+  // A floating, gutter-less overlay thumb (macOS-style) on the right edge.
+  // Its position is only an approximation of topId/MAX_ID - at this scale
+  // exact precision is meaningless, the thumb just needs to feel right.
+
+  const SCROLLBAR_WIDTH = 6;
+  const SCROLLBAR_MARGIN = 6;
+  const SCROLLBAR_TRACK_INSET = 10;
+  const SCROLLBAR_MIN_THUMB = 44;
+  const SCROLLBAR_HIT_PAD = 12; // extra horizontal grab margin beyond the drawn thumb
+
+  let scrollbarDragging = false;
+  let scrollbarHover = false;
+  let scrollbarDragOffset = 0;
+
+  function scrollbarGeometry() {
+    const trackTop = SCROLLBAR_TRACK_INSET;
+    const trackHeight = Math.max(0, H - SCROLLBAR_TRACK_INSET * 2);
+    const thumbHeight = Math.min(trackHeight, Math.max(SCROLLBAR_MIN_THUMB, trackHeight * 0.05));
+    const usableTrack = Math.max(0, trackHeight - thumbHeight);
+    const frac = Math.min(1, Math.max(0, MAX_ID_NUMBER > 0 ? Number(topId) / MAX_ID_NUMBER : 0));
+    const thumbTop = trackTop + frac * usableTrack;
+    const x = W - SCROLLBAR_MARGIN - SCROLLBAR_WIDTH;
+    return { x, trackTop, usableTrack, thumbHeight, thumbTop };
+  }
+
+  function pointerOverScrollbar(clientX, clientY, g) {
+    return clientX >= g.x - SCROLLBAR_HIT_PAD && clientX <= g.x + SCROLLBAR_WIDTH + SCROLLBAR_HIT_PAD &&
+           clientY >= g.trackTop && clientY <= g.trackTop + g.usableTrack + g.thumbHeight;
+  }
+
+  function setTopFromScrollbarY(clientY, g) {
+    const desiredThumbTop = clientY - scrollbarDragOffset;
+    const clamped = Math.min(Math.max(desiredThumbTop, g.trackTop), g.trackTop + g.usableTrack);
+    const top = maxTopId();
+
+    // Snap exactly at either end - float math on numbers this large can't be
+    // trusted to land precisely on 1 or on the last deck, so the extremes of
+    // the track are special-cased rather than derived from the fraction.
+    if (g.usableTrack <= 0 || clamped >= g.trackTop + g.usableTrack) {
+      topId = top;
+    } else if (clamped <= g.trackTop) {
+      topId = 1n;
+    } else {
+      const frac = (clamped - g.trackTop) / g.usableTrack;
+      let newTop = BigInt(Math.floor(frac * MAX_ID_NUMBER));
+      if (newTop < 1n) newTop = 1n;
+      if (newTop > top) newTop = top;
+      topId = newTop;
+    }
+    fracRows = 0;
+    displayJitter = 0;
+  }
+
+  canvas.addEventListener("mousedown", (e) => {
+    const g = scrollbarGeometry();
+    if (!pointerOverScrollbar(e.clientX, e.clientY, g)) return;
+    e.preventDefault();
+    scrollbarDragging = true;
+    scrollDirection = 0;
+    accelExponent = 0;
+    const withinThumb = e.clientY >= g.thumbTop && e.clientY <= g.thumbTop + g.thumbHeight;
+    if (withinThumb) {
+      scrollbarDragOffset = e.clientY - g.thumbTop;
+    } else {
+      scrollbarDragOffset = g.thumbHeight / 2;
+      setTopFromScrollbarY(e.clientY, g);
+    }
+  });
+
+  window.addEventListener("mousemove", (e) => {
+    const g = scrollbarGeometry();
+    scrollbarHover = pointerOverScrollbar(e.clientX, e.clientY, g);
+    if (!scrollbarDragging) return;
+    setTopFromScrollbarY(e.clientY, g);
+  });
+
+  window.addEventListener("mouseup", () => {
+    scrollbarDragging = false;
+  });
+
+  canvas.addEventListener("mouseleave", () => {
+    if (!scrollbarDragging) scrollbarHover = false;
+  });
+
   // ---------- Rendering ----------
 
   const CARD_GAP = 3;
@@ -288,6 +384,15 @@
     c.closePath();
   }
 
+  function drawScrollbar() {
+    const g = scrollbarGeometry();
+    if (g.usableTrack <= 0 && g.thumbHeight <= 0) return;
+    const active = scrollbarDragging || scrollbarHover;
+    ctx.fillStyle = active ? "rgba(0,0,0,0.42)" : "rgba(0,0,0,0.22)";
+    roundRect(ctx, g.x, g.thumbTop, SCROLLBAR_WIDTH, g.thumbHeight, SCROLLBAR_WIDTH / 2);
+    ctx.fill();
+  }
+
   function render() {
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = "#ffffff";
@@ -305,6 +410,8 @@
       if (y > H) break;
       drawRow(y, rowId);
     }
+
+    drawScrollbar();
   }
 
   function loop() {
